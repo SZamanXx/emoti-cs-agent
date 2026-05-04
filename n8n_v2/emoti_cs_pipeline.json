@@ -15,220 +15,348 @@
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
       "position": [200, 400],
-      "webhookId": "emoti-ticket"
+      "webhookId": "emoti-ticket-hybrid"
     },
     {
       "parameters": {
-        "functionCode": "// HMAC verify — recompute sha256 of timestamp + body and compare\nconst crypto = require('crypto');\nconst secret = $env.EMOTI_HMAC_SECRET;\nconst sig = $request.headers['x-webhook-signature'] || '';\nconst body = $request.body;\nconst parts = Object.fromEntries(sig.split(',').filter(p => p.includes('=')).map(p => p.split('=', 2)));\nconst t = parts.t;\nconst v = parts.v1;\nif (!t || !v) throw new Error('missing signature');\nif (Math.abs(Date.now()/1000 - parseInt(t)) > 300) throw new Error('signature stale');\nconst expected = crypto.createHmac('sha256', secret).update(`${t}.` + body).digest('hex');\nif (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(v))) throw new Error('bad signature');\nreturn [{ json: JSON.parse(body.toString('utf-8')) }];"
+        "language": "javaScript",
+        "jsCode": "// Decode raw body, extract HMAC-related metadata + idempotency key + parsed payload.\n// rawBody=true means n8n hands us body bytes in binary.data.data (base64).\nconst item = $input.first();\nconst headers = (item.json && item.json.headers) || (item.headers) || {};\nconst sigHeader = headers['x-webhook-signature'] || headers['X-Webhook-Signature'] || '';\nconst idemHeader = headers['x-idempotency-key'] || headers['X-Idempotency-Key'] || '';\n\nlet rawBody = '';\nif (item.binary && item.binary.data && item.binary.data.data) {\n  rawBody = Buffer.from(item.binary.data.data, 'base64').toString('utf-8');\n} else if (typeof item.json.body === 'string') {\n  rawBody = item.json.body;\n} else if (item.json && item.json.body) {\n  rawBody = JSON.stringify(item.json.body);\n} else {\n  rawBody = JSON.stringify(item.json || {});\n}\n\nlet parsed = {};\ntry { parsed = JSON.parse(rawBody); } catch (e) { parsed = {}; }\n\n// Parse signature header: 't=<unix>,v1=<hex>'\nlet ts = '';\nlet sigValue = '';\nif (sigHeader) {\n  const parts = Object.fromEntries(\n    sigHeader.split(',').filter(p => p.includes('=')).map(p => {\n      const [k, ...v] = p.split('=');\n      return [k.trim(), v.join('=')];\n    })\n  );\n  ts = parts.t || '';\n  sigValue = parts.v1 || '';\n}\n\nconst hmacInput = ts && rawBody ? ts + '.' + rawBody : '';\nconst sigProvided = !!(ts && sigValue);\nconst idemKey = idemHeader || ('idem-' + (parsed.message_id || parsed.channel_thread_id || ts || Date.now()));\n\n// Flat fields for downstream nodes — avoids n8n expression quirks with nested $json.parsed.X\nreturn [{ json: {\n  ts,\n  sig_value: sigValue,\n  sig_provided: sigProvided,\n  hmac_input: hmacInput,\n  idem_key: idemKey,\n  source: parsed.source || 'cms',\n  body: parsed.body || '',\n  subject: parsed.subject || null,\n  channel_thread_id: parsed.channel_thread_id || null,\n  sender: parsed.sender || null,\n  language_hint: parsed.language_hint || 'pl'\n}}];"
       },
-      "id": "hmac-1",
-      "name": "HMAC verify",
-      "type": "n8n-nodes-base.function",
-      "typeVersion": 1,
+      "id": "decode-1",
+      "name": "Decode + extract metadata",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [420, 400]
     },
     {
       "parameters": {
-        "operation": "set",
-        "key": "=idem:{{$request.headers['x-idempotency-key']}}",
-        "value": "1",
-        "ttl": 86400,
-        "expire": true
+        "action": "hmac",
+        "type": "SHA256",
+        "value": "={{ $json.hmac_input }}",
+        "secret": "={{ $env.EMOTI_HMAC_SECRET || 'demo-hmac-secret-change-me' }}",
+        "encoding": "hex",
+        "dataPropertyName": "hmac_computed"
       },
-      "id": "idem-1",
-      "name": "Idempotency (Redis SETNX)",
-      "type": "n8n-nodes-base.redis",
+      "id": "crypto-1",
+      "name": "Compute HMAC",
+      "type": "n8n-nodes-base.crypto",
       "typeVersion": 1,
       "position": [640, 400]
     },
     {
       "parameters": {
-        "functionCode": "// Layer 2: pattern pre-filter for jailbreak markers\nconst body = ($json.subject || '') + '\\n' + ($json.body || '');\nconst patterns = [\n  /\\bignore\\s+(all\\s+)?(previous|prior|above)\\s+(instructions?|prompts?|rules?)\\b/i,\n  /\\b(zignoruj|ignoruj)\\s+(poprzednie|wszystkie)\\s+(instrukcje|polecenia|reguły)\\b/i,\n  /\\byou\\s+are\\s+now\\s+/i,\n  /\\b(act\\s+as|pretend\\s+to\\s+be|udawaj|zachowuj\\s+się\\s+jak)\\b/i,\n  /<\\|?\\s*system\\s*\\|?>/i,\n  /\\b(reveal|show|repeat)\\s+(your\\s+)?(system\\s+)?(prompt|instructions)\\b/i,\n];\nconst signals = [];\nfor (const p of patterns) if (p.test(body)) signals.push(p.source.slice(0, 30));\n$json.suspected_injection_pre = signals.length > 0;\n$json.injection_signals_pre = signals;\nreturn [{ json: $json }];"
+        "language": "javaScript",
+        "jsCode": "// Decide HMAC outcome:\n//  - if no signature header was sent → SKIP (demo-friendly, backend uses same fallback)\n//  - if signature is sent → must match computed HMAC; ts within 300s\nconst dec = $('Decode + extract metadata').first().json;\nconst computed = $json.hmac_computed || '';\nconst now = Math.floor(Date.now() / 1000);\nconst ageOk = !dec.ts ? false : Math.abs(now - parseInt(dec.ts, 10)) <= 300;\n\nlet outcome = 'pass';\nlet reason = '';\nif (!dec.sig_provided) {\n  outcome = 'skip';\n  reason = 'no signature header (demo mode — backend re-verifies)';\n} else if (!ageOk) {\n  outcome = 'fail';\n  reason = 'signature timestamp outside 300s window';\n} else if (computed.toLowerCase() !== (dec.sig_value || '').toLowerCase()) {\n  outcome = 'fail';\n  reason = 'signature mismatch';\n}\n\nreturn [{ json: {\n  ...dec,\n  hmac_computed: computed,\n  hmac_outcome: outcome,\n  hmac_reason: reason\n}}];"
       },
-      "id": "prefilter-1",
-      "name": "Pre-filter regex",
-      "type": "n8n-nodes-base.function",
-      "typeVersion": 1,
+      "id": "hmac-check-1",
+      "name": "HMAC verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [860, 400]
     },
     {
       "parameters": {
-        "url": "={{$env.EMOTI_API_BASE}}/api/v1/tickets",
-        "method": "POST",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            { "name": "X-Api-Key", "value": "={{$env.EMOTI_API_KEY}}" },
-            { "name": "Content-Type", "value": "application/json" },
-            { "name": "X-Idempotency-Key", "value": "={{$request.headers['x-idempotency-key']}}" }
-          ]
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "hmac-not-fail",
+              "leftValue": "={{ $json.hmac_outcome }}",
+              "rightValue": "fail",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
         },
-        "sendBody": true,
-        "bodyParameters": {
-          "parameters": [
-            { "name": "source", "value": "={{$json.source || 'cms'}}" },
-            { "name": "subject", "value": "={{$json.subject}}" },
-            { "name": "body", "value": "={{$json.body}}" },
-            { "name": "channel_thread_id", "value": "={{$json.channel_thread_id}}" },
-            { "name": "sender", "value": "={{$json.sender}}" }
-          ]
-        },
-        "options": { "timeout": 30000 }
+        "options": {}
       },
-      "id": "backend-create-1",
-      "name": "Create ticket (backend pipeline)",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4,
+      "id": "if-hmac-1",
+      "name": "HMAC OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
       "position": [1080, 400]
     },
     {
       "parameters": {
-        "amount": 8,
+        "language": "javaScript",
+        "jsCode": "// Pattern pre-filter — port of backend services/defense.py (English + Polish jailbreak markers).\nconst d = $json;\nconst text = (d.subject || '') + '\\n' + (d.body || '');\nconst patterns = [\n  ['ignore_previous',     /\\bignore\\s+(all\\s+)?(previous|prior|above)\\s+(instructions?|prompts?|rules?)\\b/i],\n  ['ignore_polish',       /\\b(zignoruj|ignoruj)\\s+(poprzednie|wszystkie)\\s+(instrukcje|polecenia|reguły)\\b/i],\n  ['you_are_now',         /\\byou\\s+are\\s+now\\s+/i],\n  ['act_as',              /\\b(act\\s+as|pretend\\s+to\\s+be|udawaj|zachowuj\\s+się\\s+jak)\\b/i],\n  ['system_role_marker',  /<\\|?\\s*system\\s*\\|?>|^\\s*system\\s*:\\s*/im],\n  ['override_directive',  /\\b(override|bypass|disregard|disable)\\s+(?:the\\s+|all\\s+|any\\s+)?(safety|restrictions?|filter|guardrails?)\\b/i],\n  ['reveal_prompt',       /\\b(reveal|show|repeat)\\s+(your\\s+)?(system\\s+)?(prompt|instructions)\\b/i],\n  ['ai_meta',             /\\bif\\s+you\\s+are\\s+(an?\\s+)?(ai|llm|language\\s+model)\\b/i]\n];\nconst signals = [];\nfor (const [label, re] of patterns) if (re.test(text)) signals.push(label);\nreturn [{ json: { ...d, _prefilter_signals: signals, _prefilter_suspected: signals.length > 0 } }];"
+      },
+      "id": "prefilter-1",
+      "name": "Pattern pre-filter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.EMOTI_API_BASE || 'http://backend:8000' }}/api/v1/tickets",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Api-Key", "value": "={{ $env.EMOTI_API_KEY || 'demo-emoti-key-change-me' }}" },
+            { "name": "X-Idempotency-Key", "value": "={{ $json.idem_key }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ source: $json.source, body: $json.body, subject: $json.subject, channel_thread_id: $json.channel_thread_id, sender: $json.sender, language_hint: $json.language_hint }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "backend-create-1",
+      "name": "POST /api/v1/tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1520, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.ticket_id }}",
+              "rightValue": "duplicate",
+              "operator": { "type": "string", "operation": "notEquals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-not-dup-1",
+      "name": "Not a duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1640, 300]
+    },
+    {
+      "parameters": {
+        "amount": 30,
         "unit": "seconds"
       },
       "id": "wait-1",
       "name": "Wait for pipeline",
       "type": "n8n-nodes-base.wait",
       "typeVersion": 1,
-      "position": [1300, 400]
+      "position": [1740, 300]
     },
     {
       "parameters": {
-        "url": "={{$env.EMOTI_API_BASE}}/api/v1/tickets/{{$node[\"Create ticket (backend pipeline)\"].json.ticket_id}}",
         "method": "GET",
+        "url": "={{ $env.EMOTI_API_BASE || 'http://backend:8000' }}/api/v1/tickets/{{ $('POST /api/v1/tickets').item.json.ticket_id }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            { "name": "X-Api-Key", "value": "={{$env.EMOTI_API_KEY}}" }
+            { "name": "X-Api-Key", "value": "={{ $env.EMOTI_API_KEY || 'demo-emoti-key-change-me' }}" }
           ]
         },
         "options": { "timeout": 10000 }
       },
       "id": "backend-status-1",
-      "name": "Read ticket status",
+      "name": "GET ticket status",
       "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4,
-      "position": [1520, 400]
+      "typeVersion": 4.2,
+      "position": [1960, 300]
     },
     {
       "parameters": {
         "rules": {
-          "rules": [
-            { "operation": "equal", "value1": "={{$json.status}}", "value2": "escalated_human", "output": 0 },
-            { "operation": "equal", "value1": "={{$json.suspected_injection}}", "value2": "true", "output": 1 },
-            { "operation": "equal", "value1": "={{$json.status}}", "value2": "drafted", "output": 2 },
-            { "operation": "equal", "value1": "={{$json.status}}", "value2": "in_review", "output": 2 }
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.suspected_injection }}",
+                    "rightValue": true,
+                    "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "injection"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "escalated_human",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "escalated"
+            }
           ]
         },
-        "fallbackOutput": 3
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "drafted"
+        }
       },
       "id": "switch-1",
       "name": "Route by status",
       "type": "n8n-nodes-base.switch",
-      "typeVersion": 1,
-      "position": [1740, 400]
+      "typeVersion": 3,
+      "position": [2180, 300]
     },
     {
       "parameters": {
-        "url": "={{$env.SLACK_WEBHOOK_URL}}",
         "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL || 'http://backend:8000/health' }}",
         "sendBody": true,
-        "bodyParameters": {
-          "parameters": [
-            { "name": "text", "value": "🚨 ESCALATED ticket {{$json.id}} — refund/supplier dispute or killswitch. Open: {{$env.UI_BASE_URL}}/ticket/{{$json.id}}" }
-          ]
-        }
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: '⚠️ INJECTION SUSPECTED — ticket ' + $json.id + ' quarantined. Open: ' + ($env.UI_BASE_URL || 'http://localhost:5173') + '/ticket/' + $json.id }) }}",
+        "options": { "timeout": 5000 }
       },
-      "id": "slack-escalate",
-      "name": "Slack: escalation",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4,
-      "position": [2000, 200]
-    },
-    {
-      "parameters": {
-        "url": "={{$env.SLACK_WEBHOOK_URL}}",
-        "method": "POST",
-        "sendBody": true,
-        "bodyParameters": {
-          "parameters": [
-            { "name": "text", "value": "⚠️ INJECTION SUSPECTED in ticket {{$json.id}} — quarantined. Operator review required: {{$env.UI_BASE_URL}}/ticket/{{$json.id}}" }
-          ]
-        }
-      },
-      "id": "slack-injection",
+      "id": "slack-injection-1",
       "name": "Slack: injection alert",
       "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4,
-      "position": [2000, 360]
+      "typeVersion": 4.2,
+      "position": [2400, 140],
+      "continueOnFail": true,
+      "alwaysOutputData": true
     },
     {
       "parameters": {
-        "url": "={{$env.SLACK_WEBHOOK_URL}}",
         "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL || 'http://backend:8000/health' }}",
         "sendBody": true,
-        "bodyParameters": {
-          "parameters": [
-            { "name": "text", "value": "✅ Draft ready for ticket {{$json.id}} — review: {{$env.UI_BASE_URL}}/ticket/{{$json.id}}" }
-          ]
-        }
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: '🚨 ESCALATED — ticket ' + $json.id + ' (' + $json.category + ') routed to human queue. Open: ' + ($env.UI_BASE_URL || 'http://localhost:5173') + '/ticket/' + $json.id }) }}",
+        "options": { "timeout": 5000 }
       },
-      "id": "slack-draft",
+      "id": "slack-escalated-1",
+      "name": "Slack: escalation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2400, 300],
+      "continueOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL || 'http://backend:8000/health' }}",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: '✅ DRAFT READY — ticket ' + $json.id + ' (' + $json.category + ') awaiting operator review. Open: ' + ($env.UI_BASE_URL || 'http://localhost:5173') + '/ticket/' + $json.id }) }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "slack-draft-1",
       "name": "Slack: draft ready",
       "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4,
-      "position": [2000, 520]
+      "typeVersion": 4.2,
+      "position": [2400, 460],
+      "continueOnFail": true,
+      "alwaysOutputData": true
     },
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={\"ticket_id\": \"{{$json.id}}\", \"status\": \"{{$json.status}}\"}"
+        "responseBody": "={{ JSON.stringify({ ticket_id: $('GET ticket status').item.json.id, status: $('GET ticket status').item.json.status, category: $('GET ticket status').item.json.category, suspected_injection: $('GET ticket status').item.json.suspected_injection }) }}",
+        "options": { "responseCode": 200 }
       },
-      "id": "respond-1",
-      "name": "Respond to webhook",
+      "id": "respond-ok-1",
+      "name": "Respond OK",
       "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1,
-      "position": [2280, 400]
+      "typeVersion": 1.1,
+      "position": [2620, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ error: 'invalid HMAC signature', reason: $json.hmac_reason }) }}",
+        "options": { "responseCode": 401 }
+      },
+      "id": "respond-401-1",
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1300, 540]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ticket_id: 'duplicate', status: $json.status || 'duplicate_idempotent', source: 'backend-idempotency' }) }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-dup-1",
+      "name": "Respond duplicate",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1740, 540]
     }
   ],
   "connections": {
     "Inbound webhook": {
-      "main": [[{ "node": "HMAC verify", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "Decode + extract metadata", "type": "main", "index": 0 }]]
     },
-    "HMAC verify": {
-      "main": [[{ "node": "Idempotency (Redis SETNX)", "type": "main", "index": 0 }]]
+    "Decode + extract metadata": {
+      "main": [[{ "node": "Compute HMAC", "type": "main", "index": 0 }]]
     },
-    "Idempotency (Redis SETNX)": {
-      "main": [[{ "node": "Pre-filter regex", "type": "main", "index": 0 }]]
+    "Compute HMAC": {
+      "main": [[{ "node": "HMAC verdict", "type": "main", "index": 0 }]]
     },
-    "Pre-filter regex": {
-      "main": [[{ "node": "Create ticket (backend pipeline)", "type": "main", "index": 0 }]]
+    "HMAC verdict": {
+      "main": [[{ "node": "HMAC OK?", "type": "main", "index": 0 }]]
     },
-    "Create ticket (backend pipeline)": {
-      "main": [[{ "node": "Wait for pipeline", "type": "main", "index": 0 }]]
+    "HMAC OK?": {
+      "main": [
+        [{ "node": "Pattern pre-filter", "type": "main", "index": 0 }],
+        [{ "node": "Respond 401", "type": "main", "index": 0 }]
+      ]
+    },
+    "Pattern pre-filter": {
+      "main": [[{ "node": "POST /api/v1/tickets", "type": "main", "index": 0 }]]
+    },
+    "POST /api/v1/tickets": {
+      "main": [[{ "node": "Not a duplicate?", "type": "main", "index": 0 }]]
+    },
+    "Not a duplicate?": {
+      "main": [
+        [{ "node": "Wait for pipeline", "type": "main", "index": 0 }],
+        [{ "node": "Respond duplicate", "type": "main", "index": 0 }]
+      ]
     },
     "Wait for pipeline": {
-      "main": [[{ "node": "Read ticket status", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "GET ticket status", "type": "main", "index": 0 }]]
     },
-    "Read ticket status": {
+    "GET ticket status": {
       "main": [[{ "node": "Route by status", "type": "main", "index": 0 }]]
     },
     "Route by status": {
       "main": [
-        [{ "node": "Slack: escalation", "type": "main", "index": 0 }],
         [{ "node": "Slack: injection alert", "type": "main", "index": 0 }],
-        [{ "node": "Slack: draft ready", "type": "main", "index": 0 }],
+        [{ "node": "Slack: escalation", "type": "main", "index": 0 }],
         [{ "node": "Slack: draft ready", "type": "main", "index": 0 }]
       ]
     },
-    "Slack: escalation": {
-      "main": [[{ "node": "Respond to webhook", "type": "main", "index": 0 }]]
-    },
     "Slack: injection alert": {
-      "main": [[{ "node": "Respond to webhook", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "Respond OK", "type": "main", "index": 0 }]]
+    },
+    "Slack: escalation": {
+      "main": [[{ "node": "Respond OK", "type": "main", "index": 0 }]]
     },
     "Slack: draft ready": {
-      "main": [[{ "node": "Respond to webhook", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "Respond OK", "type": "main", "index": 0 }]]
     }
   },
   "settings": {
@@ -236,5 +364,5 @@
     "timezone": "Europe/Warsaw"
   },
   "active": false,
-  "version": 1
+  "version": 3
 }
