@@ -1,0 +1,108 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: emoti-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: emoti
+      POSTGRES_USER: emoti
+      POSTGRES_PASSWORD: emoti_dev_pwd
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./backend/alembic/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U emoti -d emoti"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: emoti-redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    volumes:
+      - ./data/redis:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  adminer:
+    image: adminer:latest
+    container_name: emoti-adminer
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    depends_on:
+      - postgres
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: emoti-backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://emoti:emoti_dev_pwd@postgres:5432/emoti
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8010:8000"
+    volumes:
+      - ./backend:/app
+      - ./kb_seed:/app/kb_seed:ro
+      - ./sample_data:/app/sample_data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: emoti-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      VITE_API_URL: http://localhost:8010
+    command: npm run dev -- --host 0.0.0.0
+
+  # n8n hybrid orchestrator. Optional: only spins up with `docker compose --profile hybrid up`.
+  # Imports the workflow from n8n_v2/emoti_cs_pipeline.json and uses it as the public webhook
+  # entry point that wraps the Python backend. The LLM core stays in the backend.
+  n8n:
+    image: n8nio/n8n:1.78.1
+    container_name: emoti-n8n
+    profiles: ["hybrid"]
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: http://localhost:5678
+      GENERIC_TIMEZONE: Europe/Warsaw
+      EMOTI_API_BASE: http://backend:8000
+      EMOTI_API_KEY: demo-emoti-key-change-me
+      EMOTI_HMAC_SECRET: demo-hmac-secret-change-me
+      UI_BASE_URL: http://localhost:5173
+    volumes:
+      - ./data/n8n:/home/node/.n8n
+      - ./n8n_v2:/import:ro
+    depends_on:
+      - backend

@@ -1,0 +1,240 @@
+{
+  "name": "Emoti CS Agent — V2 (n8n hybrid)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "emoti-ticket",
+        "options": {
+          "rawBody": true
+        },
+        "responseMode": "responseNode"
+      },
+      "id": "webhook-1",
+      "name": "Inbound webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 400],
+      "webhookId": "emoti-ticket"
+    },
+    {
+      "parameters": {
+        "functionCode": "// HMAC verify — recompute sha256 of timestamp + body and compare\nconst crypto = require('crypto');\nconst secret = $env.EMOTI_HMAC_SECRET;\nconst sig = $request.headers['x-webhook-signature'] || '';\nconst body = $request.body;\nconst parts = Object.fromEntries(sig.split(',').filter(p => p.includes('=')).map(p => p.split('=', 2)));\nconst t = parts.t;\nconst v = parts.v1;\nif (!t || !v) throw new Error('missing signature');\nif (Math.abs(Date.now()/1000 - parseInt(t)) > 300) throw new Error('signature stale');\nconst expected = crypto.createHmac('sha256', secret).update(`${t}.` + body).digest('hex');\nif (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(v))) throw new Error('bad signature');\nreturn [{ json: JSON.parse(body.toString('utf-8')) }];"
+      },
+      "id": "hmac-1",
+      "name": "HMAC verify",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [420, 400]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=idem:{{$request.headers['x-idempotency-key']}}",
+        "value": "1",
+        "ttl": 86400,
+        "expire": true
+      },
+      "id": "idem-1",
+      "name": "Idempotency (Redis SETNX)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [640, 400]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Layer 2: pattern pre-filter for jailbreak markers\nconst body = ($json.subject || '') + '\\n' + ($json.body || '');\nconst patterns = [\n  /\\bignore\\s+(all\\s+)?(previous|prior|above)\\s+(instructions?|prompts?|rules?)\\b/i,\n  /\\b(zignoruj|ignoruj)\\s+(poprzednie|wszystkie)\\s+(instrukcje|polecenia|reguły)\\b/i,\n  /\\byou\\s+are\\s+now\\s+/i,\n  /\\b(act\\s+as|pretend\\s+to\\s+be|udawaj|zachowuj\\s+się\\s+jak)\\b/i,\n  /<\\|?\\s*system\\s*\\|?>/i,\n  /\\b(reveal|show|repeat)\\s+(your\\s+)?(system\\s+)?(prompt|instructions)\\b/i,\n];\nconst signals = [];\nfor (const p of patterns) if (p.test(body)) signals.push(p.source.slice(0, 30));\n$json.suspected_injection_pre = signals.length > 0;\n$json.injection_signals_pre = signals;\nreturn [{ json: $json }];"
+      },
+      "id": "prefilter-1",
+      "name": "Pre-filter regex",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [860, 400]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.EMOTI_API_BASE}}/api/v1/tickets",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Api-Key", "value": "={{$env.EMOTI_API_KEY}}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "X-Idempotency-Key", "value": "={{$request.headers['x-idempotency-key']}}" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "source", "value": "={{$json.source || 'cms'}}" },
+            { "name": "subject", "value": "={{$json.subject}}" },
+            { "name": "body", "value": "={{$json.body}}" },
+            { "name": "channel_thread_id", "value": "={{$json.channel_thread_id}}" },
+            { "name": "sender", "value": "={{$json.sender}}" }
+          ]
+        },
+        "options": { "timeout": 30000 }
+      },
+      "id": "backend-create-1",
+      "name": "Create ticket (backend pipeline)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1080, 400]
+    },
+    {
+      "parameters": {
+        "amount": 8,
+        "unit": "seconds"
+      },
+      "id": "wait-1",
+      "name": "Wait for pipeline",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [1300, 400]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.EMOTI_API_BASE}}/api/v1/tickets/{{$node[\"Create ticket (backend pipeline)\"].json.ticket_id}}",
+        "method": "GET",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Api-Key", "value": "={{$env.EMOTI_API_KEY}}" }
+          ]
+        },
+        "options": { "timeout": 10000 }
+      },
+      "id": "backend-status-1",
+      "name": "Read ticket status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1520, 400]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "rules": [
+            { "operation": "equal", "value1": "={{$json.status}}", "value2": "escalated_human", "output": 0 },
+            { "operation": "equal", "value1": "={{$json.suspected_injection}}", "value2": "true", "output": 1 },
+            { "operation": "equal", "value1": "={{$json.status}}", "value2": "drafted", "output": 2 },
+            { "operation": "equal", "value1": "={{$json.status}}", "value2": "in_review", "output": 2 }
+          ]
+        },
+        "fallbackOutput": 3
+      },
+      "id": "switch-1",
+      "name": "Route by status",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [1740, 400]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.SLACK_WEBHOOK_URL}}",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "text", "value": "🚨 ESCALATED ticket {{$json.id}} — refund/supplier dispute or killswitch. Open: {{$env.UI_BASE_URL}}/ticket/{{$json.id}}" }
+          ]
+        }
+      },
+      "id": "slack-escalate",
+      "name": "Slack: escalation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2000, 200]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.SLACK_WEBHOOK_URL}}",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "text", "value": "⚠️ INJECTION SUSPECTED in ticket {{$json.id}} — quarantined. Operator review required: {{$env.UI_BASE_URL}}/ticket/{{$json.id}}" }
+          ]
+        }
+      },
+      "id": "slack-injection",
+      "name": "Slack: injection alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2000, 360]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.SLACK_WEBHOOK_URL}}",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "text", "value": "✅ Draft ready for ticket {{$json.id}} — review: {{$env.UI_BASE_URL}}/ticket/{{$json.id}}" }
+          ]
+        }
+      },
+      "id": "slack-draft",
+      "name": "Slack: draft ready",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2000, 520]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"ticket_id\": \"{{$json.id}}\", \"status\": \"{{$json.status}}\"}"
+      },
+      "id": "respond-1",
+      "name": "Respond to webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2280, 400]
+    }
+  ],
+  "connections": {
+    "Inbound webhook": {
+      "main": [[{ "node": "HMAC verify", "type": "main", "index": 0 }]]
+    },
+    "HMAC verify": {
+      "main": [[{ "node": "Idempotency (Redis SETNX)", "type": "main", "index": 0 }]]
+    },
+    "Idempotency (Redis SETNX)": {
+      "main": [[{ "node": "Pre-filter regex", "type": "main", "index": 0 }]]
+    },
+    "Pre-filter regex": {
+      "main": [[{ "node": "Create ticket (backend pipeline)", "type": "main", "index": 0 }]]
+    },
+    "Create ticket (backend pipeline)": {
+      "main": [[{ "node": "Wait for pipeline", "type": "main", "index": 0 }]]
+    },
+    "Wait for pipeline": {
+      "main": [[{ "node": "Read ticket status", "type": "main", "index": 0 }]]
+    },
+    "Read ticket status": {
+      "main": [[{ "node": "Route by status", "type": "main", "index": 0 }]]
+    },
+    "Route by status": {
+      "main": [
+        [{ "node": "Slack: escalation", "type": "main", "index": 0 }],
+        [{ "node": "Slack: injection alert", "type": "main", "index": 0 }],
+        [{ "node": "Slack: draft ready", "type": "main", "index": 0 }],
+        [{ "node": "Slack: draft ready", "type": "main", "index": 0 }]
+      ]
+    },
+    "Slack: escalation": {
+      "main": [[{ "node": "Respond to webhook", "type": "main", "index": 0 }]]
+    },
+    "Slack: injection alert": {
+      "main": [[{ "node": "Respond to webhook", "type": "main", "index": 0 }]]
+    },
+    "Slack: draft ready": {
+      "main": [[{ "node": "Respond to webhook", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Warsaw"
+  },
+  "active": false,
+  "version": 1
+}

@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "DM Sans", "Source Sans 3", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  --color-bg: #0a0f1c;
+  --color-bg-1: #0e1525;
+  --color-bg-2: #131c30;
+  --color-bg-3: #1a2540;
+
+  --color-line: #1f2a44;
+  --color-line-strong: #2c3a5c;
+
+  --color-fg: #eef1f7;
+  --color-fg-muted: #9aa3bd;
+  --color-fg-dim: #6c7693;
+
+  --color-mint: #00e5a0;
+  --color-mint-dim: #00b27a;
+  --color-amber: #f5a623;
+  --color-coral: #ff6b6b;
+  --color-violet: #8a7dff;
+  --color-azure: #4ea1ff;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--color-mint);
+  color: #0a0f1c;
+}
+
+/* Tabular figures for numbers */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-line-strong);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-fg-dim);
+}
+
+/* Markdown-ish prose for ticket bodies */
+.prose-tight {
+  white-space: pre-wrap;
+  line-height: 1.55;
+  font-size: 14.5px;
+}
+
+.glow-mint {
+  box-shadow: 0 0 0 1px rgba(0, 229, 160, 0.18), 0 8px 32px -12px rgba(0, 229, 160, 0.35);
+}

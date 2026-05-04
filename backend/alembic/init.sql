@@ -1,0 +1,6 @@
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS unaccent;
+
+-- Polish full-text search config
+CREATE TEXT SEARCH CONFIGURATION polish (COPY = simple);
